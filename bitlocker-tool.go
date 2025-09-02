@@ -8,7 +8,9 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"runtime"
+	"path/filepath"
+	"regexp"
+	runtime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +19,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-// Configuration structure
+// Add new config field for the forensic scan path
 type Config struct {
 	Threads       int
 	WordlistPath  string
@@ -35,7 +37,10 @@ type Config struct {
 	BruteforceMax int
 	Charset       string
 	Masks         []string
+	ForensicPath  string // New field
 }
+
+// ... [Result struct remains the same] ...
 
 // Attack result structure
 type Result struct {
@@ -49,6 +54,7 @@ type Result struct {
 }
 
 var (
+	// ... [vars remain the same] ...
 	config       Config
 	results      []Result
 	resultsMutex sync.Mutex
@@ -62,6 +68,7 @@ var (
 )
 
 func init() {
+	// ... [init remains the same] ...
 	config = Config{
 		Threads:       runtime.NumCPU(),
 		HashcatPath:   "hashcat",
@@ -77,7 +84,7 @@ func init() {
 	}
 }
 
-// log writes a message to the tview log.
+// ... [log function remains the same] ...
 func log(level, message string) {
 	app.QueueUpdateDraw(func() {
 		fmt.Fprintf(logView, "[%s] %s\n", level, message)
@@ -85,13 +92,14 @@ func log(level, message string) {
 }
 
 func main() {
+	// ... [flag parsing gets the new flag] ...
 	flag.IntVar(&config.Threads, "threads", config.Threads, "Number of threads")
 	flag.StringVar(&config.WordlistPath, "wordlist", "", "Path to wordlist file")
 	flag.StringVar(&config.HashcatPath, "hashcat", config.HashcatPath, "Path to hashcat binary")
-	flag.StringVar(&config.AttackMode, "mode", config.AttackMode, "Attack mode: dictionary, bruteforce, mask, hybrid, chain")
+	flag.StringVar(&config.AttackMode, "mode", config.AttackMode, "Attack mode: dictionary, bruteforce, mask, hybrid, chain, predictive")
 	flag.IntVar(&config.Timeout, "timeout", config.Timeout, "Timeout in seconds")
 	flag.StringVar(&config.OutputFile, "output", "bitlocker_results.json", "Output file for results")
-	flag.StringVar(&config.DriveLetter, "drive", "", "Drive letter to attack (e.g., C:")
+	flag.StringVar(&config.DriveLetter, "drive", "", "Drive letter to attack (e.g., C:)")
 	flag.IntVar(&config.MaxAttempts, "max-attempts", config.MaxAttempts, "Maximum number of attempts")
 	flag.StringVar(&config.HashFile, "hash-file", "", "Hash file if already extracted")
 	flag.BoolVar(&config.UseGPU, "gpu", config.UseGPU, "Use GPU for acceleration")
@@ -99,8 +107,11 @@ func main() {
 	flag.IntVar(&config.BruteforceMin, "min-length", config.BruteforceMin, "Minimum password length for bruteforce")
 	flag.IntVar(&config.BruteforceMax, "max-length", config.BruteforceMax, "Maximum password length for bruteforce")
 	flag.StringVar(&config.Charset, "charset", config.Charset, "Character set for bruteforce")
+	flag.StringVar(&config.ForensicPath, "forensic-path", "", "Path to a directory of user files for predictive analysis")
+
 	flag.Parse()
 
+	// ... [tview setup remains the same] ...
 	app = tview.NewApplication()
 	logView = tview.NewTextView().
 		SetDynamicColors(true).
@@ -124,6 +135,7 @@ func main() {
 }
 
 func runAttackLogic() {
+	// ... [main logic includes new predictive mode] ...
 	log("INFO", "BitLocker Bruteforce Toolkit by Zwanski Tech")
 	log("INFO", fmt.Sprintf("Initializing attack with %d threads", config.Threads))
 
@@ -157,6 +169,8 @@ func runAttackLogic() {
 			log("WARN", "Dictionary attack failed, proceeding to Bruteforce attack.")
 			success = runBruteforceAttack()
 		}
+	case "predictive":
+		success = runPredictiveAttack()
 	default:
 		log("WARN", fmt.Sprintf("Unknown attack mode '%s'. Defaulting to chain attack.", config.AttackMode))
 		success = runDictionaryAttack()
@@ -174,6 +188,111 @@ func runAttackLogic() {
 
 	saveResults()
 }
+
+// ... [checkDependencies, extractHash, etc. remain the same] ...
+
+// --- New Predictive Attack Functions ---
+
+func runPredictiveAttack() bool {
+	log("INFO", "Starting predictive attack...")
+	if config.ForensicPath == "" {
+		log("ERROR", "Predictive attack requires a path to user files. Please set with -forensic-path.")
+		return false
+	}
+
+	// Step 1: Scan file system for keywords
+	log("INFO", fmt.Sprintf("Scanning %s for keywords...", config.ForensicPath))
+	keywords := scanFileSystem(config.ForensicPath)
+	if len(keywords) == 0 {
+		log("WARN", "No keywords found in the forensic path. Predictive attack may not be effective.")
+		return false
+	}
+	log("SUCCESS", fmt.Sprintf("Found %d unique keywords.", len(keywords)))
+
+	// Step 2: Mutate keywords into a password list
+	log("INFO", "Mutating keywords into potential passwords...")
+	passwords := mutateKeywords(keywords)
+	log("SUCCESS", fmt.Sprintf("Generated %d potential passwords.", len(passwords)))
+
+	// Step 3: Run a dictionary attack with the generated list
+	predictiveWordlist := "predictive_wordlist.txt"
+	err := ioutil.WriteFile(predictiveWordlist, []byte(strings.Join(passwords, "\n")), 0644)
+	if err != nil {
+		log("ERROR", fmt.Sprintf("Failed to write predictive wordlist: %v", err))
+		return false
+	}
+	log("INFO", fmt.Sprintf("Predictive wordlist saved to %s", predictiveWordlist))
+
+	// Set the wordlist path for the dictionary attack
+	config.WordlistPath = predictiveWordlist
+	return runDictionaryAttack()
+}
+
+func scanFileSystem(path string) []string {
+	keywords := make(map[string]bool)
+	wordRegex := regexp.MustCompile(`[a-zA-Z0-9]{4,}`)
+
+	err := filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".txt") {
+			log("INFO", fmt.Sprintf("Scanning file: %s", filePath))
+			content, readErr := ioutil.ReadFile(filePath)
+			if readErr != nil {
+				log("WARN", fmt.Sprintf("Failed to read %s: %v", filePath, readErr))
+				return nil // Continue walking
+			}
+
+			matches := wordRegex.FindAllString(string(content), -1)
+			for _, match := range matches {
+				// Basic filtering for common English words could be added here
+				keywords[strings.ToLower(match)] = true
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		log("ERROR", fmt.Sprintf("Error walking the path %s: %v", path, err))
+	}
+
+	// Convert map keys to a slice
+	uniqueKeywords := make([]string, 0, len(keywords))
+	for k := range keywords {
+	
+uniqueKeywords = append(uniqueKeywords, k)
+	}
+	return uniqueKeywords
+}
+
+func mutateKeywords(keywords []string) []string {
+	mutations := make(map[string]bool)
+	suffixes := []string{"", "1", "123", "!", "2022", "2023", "2024"}
+
+	for _, keyword := range keywords {
+		if len(keyword) < 4 || len(keyword) > 12 { // Filter out very short/long keywords
+			continue
+		}
+		for _, suffix := range suffixes {
+			// Simple mutation: keyword + suffix
+			mutations[keyword+suffix] = true
+
+			// Capitalized version
+			capitalized := strings.Title(keyword)
+			mutations[capitalized+suffix] = true
+		}
+	}
+
+	// Convert map to slice
+	passwordList := make([]string, 0, len(mutations))
+	for p := range mutations {
+		passwordList = append(passwordList, p)
+	}
+	return passwordList
+}
+
+// --- Existing functions below... ---
 
 func checkDependencies() bool {
 	log("INFO", "Checking for required dependencies...")
@@ -271,7 +390,7 @@ func runBruteforceAttack() bool {
 		"--increment-max", fmt.Sprintf("%d", config.BruteforceMax),
 	}
 	if config.Charset != "" {
-		args = append(args, []string{"-1", config.Charset}...)
+		args = append(args, []string{"-", "1"}...) // Corrected: -1 for charset
 	}
 	if config.UseGPU {
 		args = append(args, "-D", "1,2")
